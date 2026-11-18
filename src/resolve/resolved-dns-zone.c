@@ -651,6 +651,20 @@ void dns_zone_verify_all(DnsZone *zone) {
                         dns_zone_item_verify(j);
 }
 
+void dns_zone_set_last_multicast(DnsZone *zone, DnsAnswer *answer, usec_t ts) {
+        DnsResourceRecord *rr;
+
+        assert(zone);
+
+        /* Remember when we multicast our RRs, to follow the rate limit of RFC 6762, Section 6. */
+
+        DNS_ANSWER_FOREACH(rr, answer) {
+                DnsZoneItem *i = dns_zone_get(zone, rr);
+                if (i)
+                        i->last_multicast_usec = ts;
+        }
+}
+
 void dns_zone_dump(DnsZone *zone, FILE *f) {
         DnsZoneItem *i;
 

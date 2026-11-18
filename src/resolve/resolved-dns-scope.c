@@ -37,6 +37,7 @@
 #include "set.h"
 #include "socket-util.h"
 #include "string-table.h"
+#include "time-util.h"
 
 #define MULTICAST_RATELIMIT_INTERVAL_USEC (1*USEC_PER_SEC)
 #define MULTICAST_RATELIMIT_BURST 1000
@@ -1725,6 +1726,8 @@ int dns_scope_announce(DnsScope *scope, bool goodbye) {
         r = dns_scope_emit_announcement(scope, answer);
         if (r < 0)
                 log_debug_errno(r, "Failed to emit some announcement packets, ignoring: %m");
+        else
+                dns_zone_set_last_multicast(&scope->zone, answer, now(CLOCK_BOOTTIME));
 
         /* In section 8.3 of RFC6762: "The Multicast DNS responder MUST send at least two unsolicited
          * responses, one second apart." */

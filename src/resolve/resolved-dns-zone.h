@@ -32,6 +32,9 @@ typedef struct DnsZoneItem {
 
         bool probing_enabled;
 
+        /* When this RR was last multicast on the scope's interface (CLOCK_BOOTTIME), RFC 6762 Section 6 */
+        usec_t last_multicast_usec;
+
         LIST_FIELDS(DnsZoneItem, by_key);
         LIST_FIELDS(DnsZoneItem, by_name);
 
@@ -56,6 +59,8 @@ int dns_zone_verify_conflicts(DnsZone *zone, DnsResourceKey *key);
 void dns_zone_verify_all(DnsZone *zone);
 
 void dns_zone_item_probe_stop(DnsZoneItem *i);
+
+void dns_zone_set_last_multicast(DnsZone *zone, DnsAnswer *answer, usec_t ts);
 
 void dns_zone_dump(DnsZone *zone, FILE *f);
 bool dns_zone_is_empty(DnsZone *zone);

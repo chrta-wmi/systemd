@@ -16,6 +16,11 @@
  * stronger guarantee: no link fragments a datagram that size.) */
 #define MDNS_PACKET_UNKNOWN_MTU_IPV4 576U
 
+/* RFC 6762, Section 6: minimum interval between two multicasts of the same RR on an interface */
+#define MDNS_MULTICAST_INTERVAL_USEC (1 * USEC_PER_SEC)
+
+usec_t mdns_zone_item_next_multicast_usec(const DnsZoneItem *i);
+
 int manager_mdns_ipv4_fd(Manager *m);
 int manager_mdns_ipv6_fd(Manager *m);
 

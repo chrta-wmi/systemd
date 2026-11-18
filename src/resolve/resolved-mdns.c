@@ -261,6 +261,22 @@ static bool sender_on_local_subnet(DnsScope *s, DnsPacket *p) {
         return false;
 }
 
+usec_t mdns_zone_item_next_multicast_usec(const DnsZoneItem *i) {
+        assert(i);
+
+        /* Returns the earliest time (CLOCK_BOOTTIME) at which the RR may be multicast again on the scope's
+         * interface, or 0 if it may be multicast right away.
+         *
+         * RFC 6762, Section 6: "a Multicast DNS responder MUST NOT (except in the one special case of
+         * answering probe queries) multicast a record on a given interface until at least one second has
+         * elapsed since the last time that record was multicast on that particular interface." */
+
+        if (!timestamp_is_set(i->last_multicast_usec))
+                return 0;
+
+        return usec_add(i->last_multicast_usec, MDNS_MULTICAST_INTERVAL_USEC);
+}
+
 static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         _cleanup_(dns_answer_unrefp) DnsAnswer *full_answer = NULL;
         _cleanup_(dns_packet_unrefp) DnsPacket *reply = NULL;
@@ -268,7 +284,9 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         DnsResourceRecord *rr;
         bool tentative = false;
         bool legacy_query = p->sender_port != MDNS_PORT;
+        bool probe_query = DNS_PACKET_NSCOUNT(p) > 0;
         bool unicast_reply;
+        usec_t ts = now(CLOCK_BOOTTIME);
         int r;
 
         assert(s);
@@ -340,6 +358,20 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
 
                 DNS_ANSWER_FOREACH_ITEM(item, answer) {
                         DnsAnswerFlags flags = item->flags | DNS_ANSWER_REFUSE_TTL_NO_MATCH;
+
+                        /* Probe queries are answered right away, RFC 6762, Section 6 exempts them. */
+                        if (!unicast_reply && !probe_query) {
+                                DnsZoneItem *z = dns_zone_get(&s->zone, item->rr);
+                                if (z && mdns_zone_item_next_multicast_usec(z) > ts) {
+                                        /* RFC 6762, Section 6: "A querier that did not receive and cache
+                                         * the previous transmission will retry its request and receive a
+                                         * subsequent response." */
+                                        log_debug("%s was multicast on this interface too recently, not sending it again.",
+                                                  dns_resource_record_to_string(item->rr));
+                                        continue;
+                                }
+                        }
+
                         /* The cache-flush bit must not be set in legacy unicast responses.
                          * See section 6.7 of RFC 6762. */
                         if (legacy_query)
@@ -369,6 +401,9 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         r = dns_scope_emit_udp(s, -1, AF_UNSPEC, reply);
         if (r < 0)
                 return log_debug_errno(r, "Failed to send reply packet: %m");
+
+        if (!unicast_reply)
+                dns_zone_set_last_multicast(&s->zone, full_answer, ts);
 
         return 0;
 }
