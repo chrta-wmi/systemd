@@ -261,7 +261,7 @@ static bool sender_on_local_subnet(DnsScope *s, DnsPacket *p) {
         return false;
 }
 
-usec_t mdns_zone_item_next_multicast_usec(const DnsZoneItem *i) {
+usec_t mdns_zone_item_next_multicast_usec(const DnsZoneItem *i, bool probe) {
         assert(i);
 
         /* Returns the earliest time (CLOCK_BOOTTIME) at which the RR may be multicast again on the scope's
@@ -269,12 +269,144 @@ usec_t mdns_zone_item_next_multicast_usec(const DnsZoneItem *i) {
          *
          * RFC 6762, Section 6: "a Multicast DNS responder MUST NOT (except in the one special case of
          * answering probe queries) multicast a record on a given interface until at least one second has
-         * elapsed since the last time that record was multicast on that particular interface." */
+         * elapsed since the last time that record was multicast on that particular interface." When
+         * answering a probe query, the interval only has to be at least 250 ms. */
 
         if (!timestamp_is_set(i->last_multicast_usec))
                 return 0;
 
-        return usec_add(i->last_multicast_usec, MDNS_MULTICAST_INTERVAL_USEC);
+        return usec_add(i->last_multicast_usec,
+                        probe ? MDNS_PROBE_MULTICAST_INTERVAL_USEC : MDNS_MULTICAST_INTERVAL_USEC);
+}
+
+static int on_mdns_probe_answer_timeout(sd_event_source *es, usec_t usec, void *userdata);
+
+static int mdns_scope_arm_probe_answer_timer(DnsScope *s, usec_t until) {
+        usec_t current;
+        int r;
+
+        assert(s);
+
+        /* Fire at the earliest deadline of all queued RRs, so that none of them is delayed longer than
+         * necessary. Use the highest accuracy, the default slack of sd-event (250 ms) would delay the
+         * answer further than allowed. */
+        if (!s->mdns_probe_answer_event_source) {
+                r = sd_event_add_time(
+                                s->manager->event,
+                                &s->mdns_probe_answer_event_source,
+                                CLOCK_BOOTTIME,
+                                until,
+                                /* accuracy= */ 1,
+                                on_mdns_probe_answer_timeout,
+                                s);
+                if (r < 0)
+                        return r;
+
+                (void) sd_event_source_set_description(s->mdns_probe_answer_event_source, "mdns-probe-answer");
+                return 0;
+        }
+
+        r = sd_event_source_get_time(s->mdns_probe_answer_event_source, &current);
+        if (r < 0)
+                return r;
+
+        if (until >= current)
+                return 0;
+
+        return sd_event_source_set_time(s->mdns_probe_answer_event_source, until);
+}
+
+static int on_mdns_probe_answer_timeout(sd_event_source *es, usec_t usec, void *userdata) {
+        _cleanup_(dns_answer_unrefp) DnsAnswer *pending = NULL, *answer = NULL;
+        DnsScope *s = ASSERT_PTR(userdata);
+        usec_t ts = now(CLOCK_BOOTTIME), next_timer = USEC_INFINITY;
+        DnsAnswerItem *item;
+        int r;
+
+        s->mdns_probe_answer_event_source = sd_event_source_disable_unref(s->mdns_probe_answer_event_source);
+        pending = TAKE_PTR(s->mdns_probe_answer);
+
+        DNS_ANSWER_FOREACH_ITEM(item, pending) {
+                DnsZoneItem *z = dns_zone_get(&s->zone, item->rr);
+
+                /* Skip RRs that were withdrawn in the meantime, and RRs that were multicast after the
+                 * last probe query asking for them was received, the prober has seen them then. */
+                if (!z || z->state == DNS_ZONE_ITEM_WITHDRAWN)
+                        continue;
+                if (!timestamp_is_set(z->mdns_probe_answer_queued_usec) ||
+                    z->last_multicast_usec > z->mdns_probe_answer_queued_usec)
+                        continue;
+
+                usec_t next = mdns_zone_item_next_multicast_usec(z, /* probe= */ true);
+                if (next > ts) {
+                        /* Not due yet, keep it queued. */
+                        r = dns_answer_add_extend(&s->mdns_probe_answer, item->rr, item->ifindex, item->flags, item->rrsig);
+                        if (r < 0) {
+                                log_debug_errno(r, "Failed to keep answer to probe query queued, ignoring: %m");
+                                continue;
+                        }
+
+                        next_timer = MIN(next_timer, next);
+                        continue;
+                }
+
+                r = dns_answer_add_extend(&answer, item->rr, item->ifindex, item->flags, item->rrsig);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to extend delayed answer to probe query, ignoring: %m");
+        }
+
+        if (next_timer != USEC_INFINITY) {
+                r = mdns_scope_arm_probe_answer_timer(s, next_timer);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to re-arm timer for delayed answers to probe queries, dropping them: %m");
+                        s->mdns_probe_answer = dns_answer_unref(s->mdns_probe_answer);
+                }
+        }
+
+        if (dns_answer_isempty(answer))
+                return 0;
+
+        /* Not tied to a single query anymore, so this goes out like an announcement. */
+        r = dns_scope_emit_announcement(s, answer);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to send delayed answer to probe query: %m");
+                return 0;
+        }
+
+        dns_zone_set_last_multicast(&s->zone, answer, ts);
+
+        return 0;
+}
+
+static int mdns_scope_delay_probe_answer(
+                DnsScope *s,
+                DnsZoneItem *z,
+                DnsAnswerItem *item,
+                DnsAnswerFlags flags,
+                usec_t ts) {
+
+        int r;
+
+        assert(s);
+        assert(z);
+        assert(item);
+
+        /* RFC 6762, Section 6: when answering a probe query, a responder "MUST respond quickly" and "is only
+         * required to delay its transmission as necessary to ensure an interval of at least 250 ms since the
+         * last time the record was multicast on that interface". Hence, queue the RR and send it as soon as
+         * this interval has elapsed. RRs that are due at the same time are aggregated into one response.
+         *
+         * Arm the timer before queueing the RR, so that a queued RR is never left without a timer. */
+        r = mdns_scope_arm_probe_answer_timer(s, mdns_zone_item_next_multicast_usec(z, /* probe= */ true));
+        if (r < 0)
+                return r;
+
+        r = dns_answer_add_extend(&s->mdns_probe_answer, item->rr, item->ifindex, flags, item->rrsig);
+        if (r < 0)
+                return r;
+
+        z->mdns_probe_answer_queued_usec = ts;
+        return 0;
 }
 
 static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
@@ -359,15 +491,24 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
                 DNS_ANSWER_FOREACH_ITEM(item, answer) {
                         DnsAnswerFlags flags = item->flags | DNS_ANSWER_REFUSE_TTL_NO_MATCH;
 
-                        /* Probe queries are answered right away, RFC 6762, Section 6 exempts them. */
-                        if (!unicast_reply && !probe_query) {
+                        if (!unicast_reply) {
                                 DnsZoneItem *z = dns_zone_get(&s->zone, item->rr);
-                                if (z && mdns_zone_item_next_multicast_usec(z) > ts) {
-                                        /* RFC 6762, Section 6: "A querier that did not receive and cache
-                                         * the previous transmission will retry its request and receive a
-                                         * subsequent response." */
-                                        log_debug("%s was multicast on this interface too recently, not sending it again.",
+                                usec_t next = z ? mdns_zone_item_next_multicast_usec(z, probe_query) : 0;
+                                if (next > ts) {
+                                        if (!probe_query) {
+                                                /* RFC 6762, Section 6: "A querier that did not receive
+                                                 * and cache the previous transmission will retry its
+                                                 * request and receive a subsequent response." */
+                                                log_debug("%s was multicast on this interface too recently, not sending it again.",
+                                                          dns_resource_record_to_string(item->rr));
+                                                continue;
+                                        }
+
+                                        log_debug("%s was multicast on this interface too recently, delaying the answer to the probe query.",
                                                   dns_resource_record_to_string(item->rr));
+                                        r = mdns_scope_delay_probe_answer(s, z, item, flags, ts);
+                                        if (r < 0)
+                                                log_debug_errno(r, "Failed to delay answer to probe query, ignoring: %m");
                                         continue;
                                 }
                         }

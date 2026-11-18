@@ -164,6 +164,9 @@ DnsScope* dns_scope_free(DnsScope *s) {
 
         sd_event_source_disable_unref(s->mdns_goodbye_event_source);
 
+        sd_event_source_disable_unref(s->mdns_probe_answer_event_source);
+        dns_answer_unref(s->mdns_probe_answer);
+
         dns_cache_flush(&s->cache);
         dns_zone_flush(&s->zone);
 
@@ -1543,7 +1546,7 @@ static int on_announcement_timeout(sd_event_source *s, usec_t usec, void *userda
         return 0;
 }
 
-static int dns_scope_emit_announcement(DnsScope *scope, DnsAnswer *answer) {
+int dns_scope_emit_announcement(DnsScope *scope, DnsAnswer *answer) {
         size_t max_size, fragmented_max;
         unsigned n_sent = 0, n_records = 0;
         int r, ret = 0;

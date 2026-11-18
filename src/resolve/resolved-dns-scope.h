@@ -53,6 +53,10 @@ typedef struct DnsScope {
 
         sd_event_source *mdns_goodbye_event_source;
 
+        /* mDNS answers to probe queries that are delayed, RFC 6762 Section 6 */
+        DnsAnswer *mdns_probe_answer;
+        sd_event_source *mdns_probe_answer_event_source;
+
         RateLimit ratelimit;
 
         usec_t resend_timeout;
@@ -113,6 +117,7 @@ bool dns_scope_network_good(DnsScope *s);
 int dns_scope_ifindex(DnsScope *s);
 const char* dns_scope_ifname(DnsScope *s);
 
+int dns_scope_emit_announcement(DnsScope *scope, DnsAnswer *answer);
 int dns_scope_announce(DnsScope *scope, bool goodbye);
 int dns_scope_send_goodbye(DnsScope *scope, DnsAnswer *answer);
 

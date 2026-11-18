@@ -35,6 +35,10 @@ typedef struct DnsZoneItem {
         /* When this RR was last multicast on the scope's interface (CLOCK_BOOTTIME), RFC 6762 Section 6 */
         usec_t last_multicast_usec;
 
+        /* When the most recent probe query whose multicast answer with this RR had to be delayed was
+         * received (CLOCK_BOOTTIME), RFC 6762 Section 6 */
+        usec_t mdns_probe_answer_queued_usec;
+
         LIST_FIELDS(DnsZoneItem, by_key);
         LIST_FIELDS(DnsZoneItem, by_name);
 

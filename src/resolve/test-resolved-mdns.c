@@ -25,11 +25,13 @@ TEST(mdns_zone_item_next_multicast_usec) {
         DnsZoneItem i = {};
 
         /* Never multicast before */
-        ASSERT_EQ(mdns_zone_item_next_multicast_usec(&i), 0u);
+        ASSERT_EQ(mdns_zone_item_next_multicast_usec(&i, /* probe= */ false), 0u);
+        ASSERT_EQ(mdns_zone_item_next_multicast_usec(&i, /* probe= */ true), 0u);
 
-        /* At most once per second */
+        /* Regular queries: at most once per second, probe queries: at most every 250 ms */
         i.last_multicast_usec = 10 * USEC_PER_SEC;
-        ASSERT_EQ(mdns_zone_item_next_multicast_usec(&i), 11 * USEC_PER_SEC);
+        ASSERT_EQ(mdns_zone_item_next_multicast_usec(&i, /* probe= */ false), 11 * USEC_PER_SEC);
+        ASSERT_EQ(mdns_zone_item_next_multicast_usec(&i, /* probe= */ true), 10 * USEC_PER_SEC + 250 * USEC_PER_MSEC);
 }
 
 TEST(dns_zone_set_last_multicast) {
